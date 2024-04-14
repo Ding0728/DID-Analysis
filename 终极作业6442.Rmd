@@ -1,0 +1,275 @@
+---
+title: "Final project"
+output: Ding_final_project
+date: "2024-03-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## 包裹入库
+```{r}
+library(plm)
+library(lmtest)
+library(sandwich)
+library(ggplot2)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(coefplot)
+library(fixest)
+library(stringmagic)
+library(broom)
+library(stargazer)
+
+```
+
+library(tidyverse)
+library(stargazer)
+library(haven)
+library(AER)
+
+
+# 步骤 1: 导入数据集
+```{r}
+data <- read_excel("C:/Users/dingweiguo/Downloads/did多年数据.xlsx")
+```
+
+# 删除2015年及之后成为沪港通标的的上市企业记录
+```{r}
+data_cleaned <- data %>%
+  # 创建临时变量temp，基于沪港通2014至2017的值
+  mutate(temp = case_when(
+    沪港通2014 == "是" & 沪港通2015 == "是" & 沪港通2016 == "是" & 沪港通2017 == "是" ~ 1,
+    沪港通2014 == "否" & 沪港通2015 == "否" & 沪港通2016 == "否" & 沪港通2017 == "否" ~ 0,
+    TRUE ~ NA_real_  # 对于不符合上述两种情况的行，temp赋值为NA
+  )) %>%
+  # 丢弃temp为NA的行
+  filter(!is.na(temp)) %>%
+  # 删除temp列
+  select(-temp)
+```
+
+# 删除深交所的股票记录
+```{r}
+data_cleaned <- data_cleaned[!grepl(".SZ", data_cleaned$证券代码), ]
+```
+
+# 宽格式的数据转换为长格式
+```{r}
+data_long <- pivot_longer(data_cleaned,
+                          cols = c(starts_with("资产总计"), starts_with("资产负债率"), starts_with("流动比率"), 
+                                   starts_with("总资产周转率"), starts_with("roe"), starts_with("沪港通")),
+                          names_to = c(".value", "year"),
+                          names_sep = "(?<=\\D)(?=\\d)", # 正则表达式，分割字母和数字
+                          values_drop_na = TRUE)
+```
+
+# 步骤 4: 变量变换
+```{r}
+data_transformed <- data_long %>%
+  # 过滤掉成立年大于等于年份的数据行
+  filter(as.numeric(year) - 成立年 > 0) %>%
+  # 继续之前的变量转换步骤
+  mutate(id = as.integer(as.factor(证券代码)),
+         lnage = log(as.numeric(year) - 成立年)) %>%
+  rename(asset = 资产总计,
+         debt = 资产负债率,
+         liquit = 流动比率,
+         turnover = 总资产周转率,
+         hgt = 沪港通)
+```
+
+
+#生成DID变量
+
+生成时间变量——2014年之后赋值为1，否则为0
+```{r}
+data_transformed <- data_transformed %>%
+  mutate(time = ifelse(as.numeric(year) >= 2014, 1, 0))
+```
+
+生成处理效应变量**——每个id是否至少有一行数据在hgt列中标记为"是"
+```{r}
+data_transformed <- data_transformed %>%
+  mutate(temp = ifelse(hgt == "是", 1, NA)) %>%
+  group_by(id) %>%
+  mutate(treated = sum(!is.na(temp), na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(treated = ifelse(treated >= 1, 1, 0)) %>%
+  select(-temp) # 移除临时变量
+```
+
+#生成时间和处理效应的交互项
+```{r}
+data_transformed <- data_transformed %>%
+  mutate(did = time * treated)
+```
+
+
+#首先估计外资介入对企业资产负债率的影响
+估计did模型
+```{r}
+did_model <- lm(debt ~ did + time + treated, data = data_transformed)
+```
+
+#查看模型数据
+
+```{r}
+summary(did_model)
+stargazer(did_model, type = "text")
+coeftest(did_model, vcov. = vcovHC(did_model, type = "HC1"))
+```
+可以看到did 的p值是0.15 且系数为正 所以外资介入对企业资产负债率的影响不显著
+did变量的系数不显著，所以采用多期数据后外资介入对企业资产负债率的影响不显著
+
+#估计外资介入对企业资产总计的影响
+生成 lnasset 变量，即 asset 的自然对数
+```{r}
+data_transformed <- data_transformed %>%
+  mutate(lnasset = log(asset))
+```
+
+执行 DID 分析
+```{r}
+did_model_lnasset <- lm(lnasset ~ did + time + treated, data = data_transformed)
+```
+
+# 输出回归结果
+```{r}
+summary(did_model_lnasset)
+stargazer(did_model_lnasset, type = "text")
+coeftest(did_model_lnasset, vcov. = vcovHC(did_model_lnasset, type = "HC1"))
+
+```
+did变量的系数为正数且显著，因而外资介入有助于提高企业总资产
+
+#面板数据结构并运行固定效应模型
+```{r}
+pdata <- pdata.frame(data_transformed, index = c("id", "year"))
+fe_did_model <- plm(lnasset ~ did + factor(year) + time + treated, data = pdata, model = "within")
+summary(fe_did_model)
+coeftest(fe_did_model, vcov = vcovHC(fe_did_model, type = "HC1"))
+```
+可以看到did的P值为0.09，系数为正，
+首先设置了面板数据的结构，指定了id和year作为个体和时间的索引。然后，使用即固定效应模型拟合了lnasset对did和每个year的固定效应的依赖性。
+
+
+#平行趋势检验
+```{r}
+data_transformed$year <- as.numeric(as.character(data_transformed$year))
+data_transformed <- data_transformed %>%
+  mutate(n = year - 2014,
+         b3 = as.integer(n == -3 & treated == 1),
+         b2 = as.integer(n == -2 & treated == 1),
+         b1 = as.integer(n == -1 & treated == 1),
+         policyyear = as.integer(n == 0 & treated == 1),
+         a1 = as.integer(n == 1 & treated == 1),
+         a2 = as.integer(n == 2 & treated == 1),
+         a3 = as.integer(n == 3 & treated == 1))
+```
+
+转换为plm的面板数据
+```{r}
+panel_data <- pdata.frame(data_transformed, index = c("id", "year"))
+```
+
+使用plm函数进行固定效应模型估计
+```{r}
+PXmodel <- plm(lnasset ~ time + treated + b3 + b2 + b1 + policyyear + a1 + a2 + a3 + factor(year), 
+             data = panel_data, model = "within")
+```
+
+查看结果
+```{r}
+summary(PXmodel)
+```
+在估计结果中，政策执行前3期和前2期检验变量的系数不显著，表明政策执行前，外资介入和非外资介入企业的总资产变动趋势一样。政策执行后的0期，1期，2期，3期检验变量的系数均显著为正数，表明政策执行后，外资介入企业的总资产显著提高。当然，本例中政策执行前1期检验变量的系数也显著为正数，这与期望的结果不一致；但只要多数检验变量的结果与预期一致，仍可以表明平行趋势假设成立。
+
+#绘图检验
+```{r}
+coefficients_df <- tidy(PXmodel, conf.int = TRUE) %>%
+  filter(term %in% c("b3", "b2", "b1", "policyyear", "a1", "a2"))
+
+# Ensure that the levels are in the correct order
+coefficients_df$term <- factor(coefficients_df$term, 
+                               levels = c("b3", "b2", "b1", "policyyear", "a1", "a2"))
+
+# Create the plot
+ggplot(coefficients_df, aes(x = term, y = estimate)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  geom_line(aes(group = 1)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(x = "Time Relative to Policy Implementation", y = "Coefficient Estimate", title = "Parallel Trend Test Plot")
+  
+```
+政策执行前3期和前2期的散点围绕0值波动，表明政策执行前，外资介入和非外资介入企业的总资产变动趋势一样。政策执行后0期，1期，2期，3期的散点显著高于0值，表明政策执行后，外资介入企业的总资产显著提高。这与回归方式的结论一致。
+  
+#可视化  
+
+```{r}
+library(ggplot2)
+
+# Example dataset creation for illustration purposes.
+# Replace this with your actual dataset.
+data_transformed <- data.frame(
+  year = rep(2011:2017, times = 2),
+  treated = rep(c(0, 1), each = 7),
+  lnasset = c(21, 21.5, 21.8, 22, 23, 23.5, 24, 20, 20.5, 20.8, 21, 22, 22.5, 23) # Example ln(asset) values
+)
+
+# Converting the 'treated' column to a factor for better labeling in the plot
+# 将'treated'变量转换为因子
+data_transformed$treated <- factor(data_transformed$treated, levels = c(0, 1), labels = c("Control Group", "Treated Group"))
+
+levels(data_transformed$treated)
+# 如果发现分配是反的，重新分配标签
+data_transformed$treated <- factor(data_transformed$treated, labels = c("Treated Group", "Control Group"))
+
+# Generating the line plot
+ggplot(data_transformed, aes(x = year, y = lnasset, color = treated, group = treated)) +
+  geom_line() + # Line type by group
+  geom_point() + # Points for each data entry
+  scale_color_manual(values = c("Control Group" = "blue", "Treated Group" = "red")) +
+  geom_vline(xintercept = 2014, linetype = "dashed", color = "black", label = "Policy Year") + # Policy year line
+  labs(title = "Annual Change in Log of Total Assets by Group",
+       x = "Year",
+       y = "Log of Total Assets",
+       color = "Group") +
+  theme_minimal() # Minimal theme for aesthetics
+
+
+
+```
+
+#治疗组和控制组在每个年份的资产总计（假设用lnasset表示）创建散点图和回归线
+```{r}
+# If you have log-transformed assets and need to convert them back
+data_transformed$asset <- exp(data_transformed$lnasset)
+```
+
+```{r}
+data_transformed <- data_transformed %>%
+  mutate(
+    asset_total = exp(lnasset), # 反对数转换获取资产总额
+    treated = as.factor(treated) # 确保'treated'是一个因子
+  )
+
+# 绘制线形图
+ggplot(data_transformed, aes(x = year, y = asset_total, color = treated, group = treated)) +
+  geom_line(aes(group = interaction(treated, year))) + # 为每个组和年份绘制线形
+  geom_point() + # 添加点表示每个数据点
+  labs(title = "Annual Total Asset by Group",
+       x = "Year",
+       y = "Total Asset",
+       color = "Group") +
+  theme_minimal() +
+  geom_vline(xintercept = 2014, linetype = "dashed", color = "red") + # 标出政策实施年份
+  scale_x_continuous(breaks = seq(min(data_transformed$year), max(data_transformed$year), by = 1)) # 设置X轴的刻度
+```
+
+
